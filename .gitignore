@@ -1,0 +1,46 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.ini
+*.bak
+*.bak_*
+*.pem
+*.key
+*.pfx
+*.p12
+*secret*
+*credential*
+*token*
+
+# Logs and caches
+*.log
+logs/
+*.cache
+cache/
+__pycache__/
+*.py[cod]
+
+# Dependencies and build output
+node_modules/
+vendor/
+venv/
+.venv/
+bin/
+obj/
+build/
+dist/
+out/
+*.exe
+*.dll
+*.pdb
+*.zip
+
+# Local editor and system files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
