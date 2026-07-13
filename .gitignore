@@ -36,6 +36,17 @@ out/
 *.pdb
 *.zip
 
+# Local release packaging and verification directories
+outputs/
+release/
+work/build-v*/
+work/package-v*/
+work/*Package*/
+work/*ExtractTest*/
+work/DefenderScanTest*/
+work/ConfigWriteTest/
+work/NoAssetStartTest/
+
 # Local editor and system files
 .vs/
 .vscode/
