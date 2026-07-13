@@ -1,0 +1,27 @@
+地狱潜兵 CPU 修改器 v1.6 构建说明
+
+技术栈：Windows Forms / .NET Framework 4.x
+外部依赖：无
+
+一、构建主程序
+
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /platform:x64 /codepage:65001 /win32manifest:app.manifest /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:地狱潜兵CPU修改器.exe Helldivers2CpuFixer.cs
+
+二、构建集成测试
+
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:exe /platform:x64 /codepage:65001 /main:Helldivers2CpuFixer.Tests.Program /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:Helldivers2CpuFixer.Tests.exe Helldivers2CpuFixer.cs Helldivers2CpuFixer.Tests.cs
+
+三、测试说明
+
+运行 Helldivers2CpuFixer.Tests.exe [测试目录]。
+测试覆盖安全写入、临时文件校验、只读恢复、替换后故障回滚、恢复保护副本、备份上限、缺失文件、损坏设置回退和 Steam URI 合同。
+
+Helldivers2ProcessStub.cs 只用于构建一个名为 helldivers2.exe 的短时测试进程，以验证运行中检测；它不会进入主程序或分享包。
+
+四、发布内容
+
+分享包只需：
+- 地狱潜兵CPU修改器.exe
+- 分享版说明文档.txt
+
+源码包包含主源码、测试源码、测试进程源码、DPI manifest、构建说明、README 和 USAGE。
