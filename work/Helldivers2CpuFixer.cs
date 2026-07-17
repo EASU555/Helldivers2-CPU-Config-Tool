@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -16,8 +17,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Local User Tool")]
 [assembly: AssemblyProduct("Helldivers 2 CPU Config Tool")]
 [assembly: AssemblyCopyright("Local User")]
-[assembly: AssemblyVersion("1.6.0.0")]
-[assembly: AssemblyFileVersion("1.6.0.0")]
+[assembly: AssemblyVersion("1.6.10.0")]
+[assembly: AssemblyFileVersion("1.6.10.0")]
 
 namespace Helldivers2CpuFixer
 {
@@ -25,7 +26,7 @@ namespace Helldivers2CpuFixer
     {
         internal const string AppId = "553850";
         internal const string SteamLaunchUri = "steam://rungameid/553850";
-        internal const string Version = "1.6.0";
+        internal const string Version = "1.6.10";
         internal const string ThreadsPattern = @"(?im)^\s*num[\s_]+reserved[\s_]+threads\s*=\s*(\d+)";
         internal const string ThreadsReplacePattern = @"(?im)^(\s*num[\s_]+reserved[\s_]+threads\s*=\s*)\d+([^\r\n]*)";
         internal const string MemoryPattern = @"(?im)^\s*memory_size\s*=\s*(\d+)";
@@ -59,6 +60,11 @@ namespace Helldivers2CpuFixer
             get { return ReservedThreads.HasValue || MemorySize.HasValue || Refills.HasValue; }
         }
 
+        internal bool HasAllValues
+        {
+            get { return ReservedThreads.HasValue && MemorySize.HasValue && Refills.HasValue; }
+        }
+
         internal string ToDisplayText()
         {
             return "num_reserved_threads=" + ValueOrMissing(ReservedThreads) +
@@ -83,14 +89,36 @@ namespace Helldivers2CpuFixer
 
     internal sealed class ApplyResult
     {
+        internal bool Changed;
         internal string BackupPath;
+        internal string MaintenanceWarning;
+    }
+
+    internal sealed class RestoreResult
+    {
+        internal string PreRestoreBackupPath;
+        internal bool LegacyBackupWithoutIntegrityMetadata;
         internal string MaintenanceWarning;
     }
 
     internal static class ConfigFileOperations
     {
+        internal const long MaxConfigFileBytes = 16L * 1024L * 1024L;
+        internal const int MinimumMemorySize = 1 * 1024 * 1024;
+        internal const int MaximumMemorySize = 512 * 1024 * 1024;
+        internal const int MinimumRefills = 1;
+        internal const int MaximumRefills = 16;
+        internal const int MinimumAvailableThreads = 4;
+
+        private sealed class FileFingerprint
+        {
+            internal long Length;
+            internal string Sha256;
+        }
+
         internal static string ReadText(string path)
         {
+            EnsureFileWithinSizeLimit(path, "文本文件");
             return File.ReadAllText(path, Encoding.UTF8);
         }
 
@@ -142,9 +170,79 @@ namespace Helldivers2CpuFixer
             return string.Join("、", missing.ToArray());
         }
 
+        internal static string FindDuplicateRequiredKeys(string text, ConfigTarget target)
+        {
+            if (target == null) throw new ArgumentNullException("target");
+            var duplicates = new List<string>();
+            if (target.ModifyCpu && Regex.Matches(text ?? "", AppConstants.ThreadsPattern).Count > 1)
+            {
+                duplicates.Add("num_reserved_threads");
+            }
+            if (target.ModifyAudio && Regex.Matches(text ?? "", AppConstants.MemoryPattern).Count > 1)
+            {
+                duplicates.Add("memory_size");
+            }
+            if (target.ModifyAudio && Regex.Matches(text ?? "", AppConstants.RefillsPattern).Count > 1)
+            {
+                duplicates.Add("num_refills_in_voice");
+            }
+            return string.Join("、", duplicates.ToArray());
+        }
+
+        internal static bool ValidateTarget(ConfigTarget target, int logicalThreads, out string error)
+        {
+            if (target == null)
+            {
+                error = "目标参数不能为空。";
+                return false;
+            }
+            if (!target.ModifyCpu && !target.ModifyAudio)
+            {
+                error = "至少勾选一个要修改的项目。";
+                return false;
+            }
+            if (target.ModifyCpu)
+            {
+                if (target.ReservedThreads < 0)
+                {
+                    error = "保留线程数不能为负数。";
+                    return false;
+                }
+                logicalThreads = Math.Max(1, logicalThreads);
+                if (target.ReservedThreads >= logicalThreads)
+                {
+                    error = "保留线程数必须小于 CPU 逻辑线程总数（" + logicalThreads + "）。";
+                    return false;
+                }
+                var available = logicalThreads - target.ReservedThreads;
+                if (available < MinimumAvailableThreads)
+                {
+                    error = "该设置只给游戏留下 " + available + " 个线程。为避免无法运行或严重卡顿，至少需要 " + MinimumAvailableThreads + " 个可用线程。";
+                    return false;
+                }
+            }
+            if (target.ModifyAudio)
+            {
+                if (target.MemorySize < MinimumMemorySize || target.MemorySize > MaximumMemorySize)
+                {
+                    error = "音频缓存必须在 1 MB 到 512 MB 之间。";
+                    return false;
+                }
+                if (target.Refills < MinimumRefills || target.Refills > MaximumRefills)
+                {
+                    error = "音频缓冲补充次数必须在 1 到 16 之间。";
+                    return false;
+                }
+            }
+            error = null;
+            return true;
+        }
+
         internal static void VerifyTarget(string path, ConfigTarget target)
         {
-            var current = ReadSnapshot(path);
+            var text = ReadText(path);
+            EnsureUniqueRequiredKeys(text, target);
+            var current = ParseSnapshot(text);
             if (target.ModifyCpu && current.ReservedThreads != target.ReservedThreads)
             {
                 throw new InvalidOperationException("num_reserved_threads 未变成目标值。");
@@ -161,6 +259,7 @@ namespace Helldivers2CpuFixer
 
         internal static ApplyResult ApplySafely(
             string path,
+            string expectedOriginalText,
             string newText,
             ConfigTarget target,
             bool lockAfterSuccess,
@@ -170,13 +269,51 @@ namespace Helldivers2CpuFixer
             {
                 throw new FileNotFoundException("配置文件不存在。", path);
             }
+            if (expectedOriginalText == null) throw new ArgumentNullException("expectedOriginalText");
+            if (newText == null) throw new ArgumentNullException("newText");
+
+            string validationError;
+            if (!ValidateTarget(target, Environment.ProcessorCount, out validationError))
+            {
+                throw new ArgumentOutOfRangeException("target", validationError);
+            }
+            EnsureSafeConfigFile(path, "配置文件");
+            EnsureTextWithinSizeLimit(expectedOriginalText, "原配置内容");
+            EnsureTextWithinSizeLimit(newText, "目标配置内容");
+            EnsureUniqueRequiredKeys(expectedOriginalText, target);
+            EnsureUniqueRequiredKeys(newText, target);
+
+            VerifyFileMatchesText(path, expectedOriginalText, "配置文件已被其他程序修改，请刷新后重新确认。");
+            if (newText == expectedOriginalText)
+            {
+                VerifyTarget(path, target);
+                if (lockAfterSuccess && !IsReadOnly(path))
+                {
+                    try
+                    {
+                        SetReadOnly(path, true);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw BuildStepException(
+                            "将配置文件设为只读",
+                            ex,
+                            "配置内容没有变化，无需回滚",
+                            null,
+                            null);
+                    }
+                }
+                return new ApplyResult { Changed = false };
+            }
 
             var originalAttributes = File.GetAttributes(path);
-            var backupPath = path + ".bak_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+            var backupPath = MakeBackupPath(path, null);
             var tempPath = MakeTempPath(path, "write");
             var step = "准备";
             var rollbackResult = "原文件尚未替换，无需回滚";
             var replaced = false;
+            var backupCreated = false;
+            FileFingerprint replacementFingerprint = null;
             Exception operationError = null;
             Exception attributeError = null;
             Exception cleanupError = null;
@@ -184,8 +321,12 @@ namespace Helldivers2CpuFixer
             try
             {
                 step = "创建修改前备份";
-                File.Copy(path, backupPath, false);
-                NormalizeTemporaryFileAttributes(backupPath);
+                CreateVerifiedBackup(path, backupPath);
+                backupCreated = true;
+                VerifyFileMatchesText(
+                    backupPath,
+                    expectedOriginalText,
+                    "配置文件在确认后发生变化，已停止修改。");
                 Checkpoint(testCheckpoint, "after_backup");
 
                 step = "写入同目录临时文件";
@@ -193,7 +334,15 @@ namespace Helldivers2CpuFixer
 
                 step = "校验临时文件参数";
                 VerifyTarget(tempPath, target);
+                replacementFingerprint = GetFingerprint(tempPath);
                 Checkpoint(testCheckpoint, "after_temp_verify");
+
+                step = "确认配置文件未被其他程序修改";
+                VerifyFilesIdentical(
+                    backupPath,
+                    path,
+                    "配置文件在确认后发生变化，已停止修改。");
+                Checkpoint(testCheckpoint, "before_replace");
 
                 step = "临时解除原文件只读属性";
                 ClearReadOnly(path);
@@ -204,6 +353,10 @@ namespace Helldivers2CpuFixer
                 Checkpoint(testCheckpoint, "after_replace");
 
                 step = "再次校验原配置文件";
+                VerifyFingerprint(
+                    path,
+                    replacementFingerprint,
+                    "替换后的配置文件与已校验临时文件不完全一致。");
                 VerifyTarget(path, target);
                 Checkpoint(testCheckpoint, "after_final_verify");
             }
@@ -222,6 +375,19 @@ namespace Helldivers2CpuFixer
                         rollbackResult = "自动回滚失败：" + rollbackError.Message;
                     }
                 }
+                else if (backupCreated)
+                {
+                    try
+                    {
+                        DeleteBackupBundle(backupPath);
+                        rollbackResult = "原文件尚未替换，已删除冗余备份";
+                    }
+                    catch (Exception cleanupBackupError)
+                    {
+                        cleanupError = cleanupBackupError;
+                        rollbackResult = "原文件尚未替换，但冗余备份清理失败";
+                    }
+                }
             }
             finally
             {
@@ -231,13 +397,14 @@ namespace Helldivers2CpuFixer
                 }
                 catch (Exception ex)
                 {
-                    cleanupError = ex;
+                    if (cleanupError == null) cleanupError = ex;
                 }
 
                 try
                 {
                     if (File.Exists(path))
                     {
+                        EnsureSafeConfigFile(path, "配置文件");
                         File.SetAttributes(path, originalAttributes);
                     }
                 }
@@ -249,6 +416,14 @@ namespace Helldivers2CpuFixer
 
             if (operationError != null)
             {
+                try
+                {
+                    PruneBackups(path, 10);
+                }
+                catch (Exception pruneError)
+                {
+                    if (cleanupError == null) cleanupError = pruneError;
+                }
                 throw BuildStepException(step, operationError, rollbackResult, cleanupError, attributeError);
             }
 
@@ -285,12 +460,13 @@ namespace Helldivers2CpuFixer
 
             return new ApplyResult
             {
+                Changed = true,
                 BackupPath = backupPath,
                 MaintenanceWarning = maintenanceWarning
             };
         }
 
-        internal static void RestoreBackupSafely(string backupPath, string targetPath, Action<string> testCheckpoint)
+        internal static RestoreResult RestoreBackupSafely(string backupPath, string targetPath, Action<string> testCheckpoint)
         {
             if (string.IsNullOrEmpty(backupPath) || !File.Exists(backupPath))
             {
@@ -301,17 +477,38 @@ namespace Helldivers2CpuFixer
                 throw new FileNotFoundException("目标配置文件不存在。", targetPath);
             }
 
+            EnsureSafeConfigFile(backupPath, "备份文件");
+            EnsureSafeConfigFile(targetPath, "目标配置文件");
             var originalAttributes = File.GetAttributes(targetPath);
-            var backupSnapshot = ReadSnapshot(backupPath);
-            if (!backupSnapshot.HasAnyValue)
+            var backupText = ReadText(backupPath);
+            var restoreTarget = new ConfigTarget
             {
-                throw new InvalidDataException("备份文件不包含可校验的关键参数，已停止恢复。 ");
+                ModifyCpu = true,
+                ModifyAudio = true
+            };
+            EnsureUniqueRequiredKeys(backupText, restoreTarget);
+            var backupSnapshot = ParseSnapshot(backupText);
+            if (!backupSnapshot.HasAllValues)
+            {
+                throw new InvalidDataException("备份文件缺少一个或多个必要参数，可能已损坏或截断，已停止恢复。");
             }
+            restoreTarget.ReservedThreads = backupSnapshot.ReservedThreads.Value;
+            restoreTarget.MemorySize = backupSnapshot.MemorySize.Value;
+            restoreTarget.Refills = backupSnapshot.Refills.Value;
+            string validationError;
+            if (!ValidateTarget(restoreTarget, Environment.ProcessorCount, out validationError))
+            {
+                throw new InvalidDataException("备份参数超出安全范围，已停止恢复：" + validationError);
+            }
+            var legacyBackup = !ValidateBackupIntegrityMetadata(backupPath);
+            var backupFingerprint = GetFingerprint(backupPath);
 
-            var guardPath = MakeTempPath(targetPath, "restore_guard");
+            var guardPath = MakeBackupPath(targetPath, "pre_restore");
             var replacementPath = MakeTempPath(targetPath, "restore");
             var step = "准备恢复";
             var replaced = false;
+            var guardCreated = false;
+            var rollbackSucceeded = false;
             Exception operationError = null;
             Exception attributeError = null;
             Exception cleanupError = null;
@@ -319,17 +516,27 @@ namespace Helldivers2CpuFixer
 
             try
             {
-                step = "创建恢复保护副本";
-                File.Copy(targetPath, guardPath, false);
-                NormalizeTemporaryFileAttributes(guardPath);
+                step = "创建恢复前永久备份";
+                CreateVerifiedBackup(targetPath, guardPath);
+                guardCreated = true;
 
                 step = "复制备份到同目录临时文件";
                 File.Copy(backupPath, replacementPath, false);
                 NormalizeTemporaryFileAttributes(replacementPath);
 
                 step = "校验恢复临时文件";
+                VerifyFingerprint(
+                    replacementPath,
+                    backupFingerprint,
+                    "恢复临时文件与所选备份不完全一致。");
                 VerifySameCriticalValues(backupSnapshot, ReadSnapshot(replacementPath));
                 Checkpoint(testCheckpoint, "before_restore_replace");
+
+                step = "确认目标配置未被其他程序修改";
+                VerifyFilesIdentical(
+                    guardPath,
+                    targetPath,
+                    "目标配置在恢复确认后发生变化，已停止恢复。");
 
                 step = "临时解除目标文件只读属性";
                 ClearReadOnly(targetPath);
@@ -340,6 +547,10 @@ namespace Helldivers2CpuFixer
                 Checkpoint(testCheckpoint, "after_restore_replace");
 
                 step = "校验恢复结果";
+                VerifyFingerprint(
+                    targetPath,
+                    backupFingerprint,
+                    "恢复后的配置文件与所选备份不完全一致。");
                 VerifySameCriticalValues(backupSnapshot, ReadSnapshot(targetPath));
             }
             catch (Exception ex)
@@ -350,6 +561,7 @@ namespace Helldivers2CpuFixer
                     try
                     {
                         RestoreBackupCore(guardPath, targetPath, originalAttributes);
+                        rollbackSucceeded = true;
                         rollbackResult = "已恢复到执行恢复前的配置";
                     }
                     catch (Exception rollbackError)
@@ -357,18 +569,29 @@ namespace Helldivers2CpuFixer
                         rollbackResult = "恢复保护副本失败：" + rollbackError.Message;
                     }
                 }
+                if (guardCreated && (!replaced || rollbackSucceeded))
+                {
+                    try
+                    {
+                        DeleteBackupBundle(guardPath);
+                        guardCreated = false;
+                    }
+                    catch (Exception cleanupGuardError)
+                    {
+                        cleanupError = cleanupGuardError;
+                    }
+                }
             }
             finally
             {
                 try { DeleteTemporaryFile(replacementPath); }
-                catch (Exception ex) { cleanupError = ex; }
-                try { DeleteTemporaryFile(guardPath); }
                 catch (Exception ex) { if (cleanupError == null) cleanupError = ex; }
 
                 try
                 {
                     if (File.Exists(targetPath))
                     {
+                        EnsureSafeConfigFile(targetPath, "目标配置文件");
                         File.SetAttributes(targetPath, originalAttributes);
                     }
                 }
@@ -380,6 +603,14 @@ namespace Helldivers2CpuFixer
 
             if (operationError != null)
             {
+                try
+                {
+                    PruneBackups(targetPath, 10);
+                }
+                catch (Exception pruneError)
+                {
+                    if (cleanupError == null) cleanupError = pruneError;
+                }
                 throw BuildStepException(step, operationError, rollbackResult, cleanupError, attributeError);
             }
             if (attributeError != null || cleanupError != null)
@@ -388,19 +619,31 @@ namespace Helldivers2CpuFixer
                 var postError = attributeError != null ? attributeError : cleanupError;
                 throw BuildStepException(postStep, postError, "恢复内容已完成，请检查文件状态", null, null);
             }
+
+            string maintenanceWarning = null;
+            try
+            {
+                PruneBackups(targetPath, 10);
+            }
+            catch (Exception ex)
+            {
+                maintenanceWarning = "恢复成功，但清理旧备份失败：" + ex.Message;
+            }
+            return new RestoreResult
+            {
+                PreRestoreBackupPath = guardPath,
+                LegacyBackupWithoutIntegrityMetadata = legacyBackup,
+                MaintenanceWarning = maintenanceWarning
+            };
         }
 
         internal static void PruneBackups(string settingsPath, int keepCount)
         {
-            var directory = Path.GetDirectoryName(settingsPath);
-            var fileName = Path.GetFileName(settingsPath);
-            var backups = Directory.GetFiles(directory, fileName + ".bak_*");
-            Array.Sort(backups, StringComparer.OrdinalIgnoreCase);
-            var removeCount = backups.Length - keepCount;
-            for (var i = 0; i < removeCount; i++)
+            var backups = GetBackups(settingsPath);
+            var firstRemoval = Math.Max(0, keepCount);
+            for (var i = firstRemoval; i < backups.Length; i++)
             {
-                ClearReadOnly(backups[i]);
-                File.Delete(backups[i]);
+                DeleteBackupBundle(backups[i]);
             }
         }
 
@@ -408,7 +651,16 @@ namespace Helldivers2CpuFixer
         {
             var directory = Path.GetDirectoryName(settingsPath);
             var fileName = Path.GetFileName(settingsPath);
-            var backups = Directory.GetFiles(directory, fileName + ".bak_*");
+            var candidates = Directory.GetFiles(directory, fileName + ".bak_*");
+            var backupList = new List<string>();
+            foreach (var candidate in candidates)
+            {
+                if (!candidate.EndsWith(".integrity", StringComparison.OrdinalIgnoreCase))
+                {
+                    backupList.Add(candidate);
+                }
+            }
+            var backups = backupList.ToArray();
             Array.Sort(backups, StringComparer.OrdinalIgnoreCase);
             Array.Reverse(backups);
             return backups;
@@ -416,6 +668,7 @@ namespace Helldivers2CpuFixer
 
         internal static void SetReadOnly(string path, bool readOnly)
         {
+            EnsureSafeConfigFile(path, "配置文件");
             var attributes = File.GetAttributes(path);
             var updated = readOnly
                 ? attributes | FileAttributes.ReadOnly
@@ -425,23 +678,22 @@ namespace Helldivers2CpuFixer
 
         internal static bool IsReadOnly(string path)
         {
+            EnsureSafeConfigFile(path, "配置文件");
             return (File.GetAttributes(path) & FileAttributes.ReadOnly) == FileAttributes.ReadOnly;
         }
 
         private static void RestoreBackupCore(string backupPath, string targetPath, FileAttributes desiredAttributes)
         {
             var expected = ReadSnapshot(backupPath);
-            if (!expected.HasAnyValue)
-            {
-                throw new InvalidDataException("回滚备份缺少关键参数。");
-            }
+            var backupFingerprint = GetFingerprint(backupPath);
 
             var tempPath = MakeTempPath(targetPath, "rollback");
             try
             {
                 File.Copy(backupPath, tempPath, false);
                 NormalizeTemporaryFileAttributes(tempPath);
-                VerifySameCriticalValues(expected, ReadSnapshot(tempPath));
+                VerifyFingerprint(tempPath, backupFingerprint, "回滚临时文件与备份不完全一致。");
+                if (expected.HasAnyValue) VerifySameCriticalValues(expected, ReadSnapshot(tempPath));
                 if (File.Exists(targetPath))
                 {
                     ClearReadOnly(targetPath);
@@ -451,7 +703,8 @@ namespace Helldivers2CpuFixer
                 {
                     File.Move(tempPath, targetPath);
                 }
-                VerifySameCriticalValues(expected, ReadSnapshot(targetPath));
+                VerifyFingerprint(targetPath, backupFingerprint, "回滚后的配置文件与备份不完全一致。");
+                if (expected.HasAnyValue) VerifySameCriticalValues(expected, ReadSnapshot(targetPath));
             }
             finally
             {
@@ -510,6 +763,7 @@ namespace Helldivers2CpuFixer
 
         private static void WriteTextDurable(string path, string text)
         {
+            EnsureTextWithinSizeLimit(text, "待写入内容");
             var bytes = new UTF8Encoding(false).GetBytes(text);
             using (var stream = new FileStream(
                 path,
@@ -521,6 +775,143 @@ namespace Helldivers2CpuFixer
             {
                 stream.Write(bytes, 0, bytes.Length);
                 stream.Flush(true);
+            }
+        }
+
+        private static string MakeBackupPath(string settingsPath, string purpose)
+        {
+            var token = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + "_" +
+                        Guid.NewGuid().ToString("N").Substring(0, 8);
+            if (!string.IsNullOrEmpty(purpose)) token += "_" + purpose;
+            return settingsPath + ".bak_" + token;
+        }
+
+        private static string GetIntegrityMetadataPath(string backupPath)
+        {
+            return backupPath + ".integrity";
+        }
+
+        private static void CreateVerifiedBackup(string sourcePath, string backupPath)
+        {
+            try
+            {
+                var sourceFingerprint = GetFingerprint(sourcePath);
+                File.Copy(sourcePath, backupPath, false);
+                NormalizeTemporaryFileAttributes(backupPath);
+                VerifyFingerprint(backupPath, sourceFingerprint, "备份文件与原配置不完全一致。");
+                WriteIntegrityMetadata(backupPath, sourceFingerprint);
+            }
+            catch
+            {
+                try { DeleteBackupBundle(backupPath); }
+                catch { }
+                throw;
+            }
+        }
+
+        private static void WriteIntegrityMetadata(string backupPath, FileFingerprint fingerprint)
+        {
+            var metadataPath = GetIntegrityMetadataPath(backupPath);
+            var text = "Version=1\r\n" +
+                       "Length=" + fingerprint.Length + "\r\n" +
+                       "SHA256=" + fingerprint.Sha256 + "\r\n";
+            WriteTextDurable(metadataPath, text);
+            NormalizeTemporaryFileAttributes(metadataPath);
+        }
+
+        private static bool ValidateBackupIntegrityMetadata(string backupPath)
+        {
+            var metadataPath = GetIntegrityMetadataPath(backupPath);
+            if (!File.Exists(metadataPath)) return false;
+            EnsureSafeConfigFile(metadataPath, "备份完整性信息");
+
+            long expectedLength = -1;
+            string expectedHash = null;
+            foreach (var rawLine in File.ReadAllLines(metadataPath, Encoding.UTF8))
+            {
+                var line = (rawLine ?? "").Trim();
+                var separator = line.IndexOf('=');
+                if (separator <= 0) continue;
+                var key = line.Substring(0, separator).Trim();
+                var value = line.Substring(separator + 1).Trim();
+                if (key.Equals("Length", StringComparison.OrdinalIgnoreCase))
+                {
+                    long parsed;
+                    if (long.TryParse(value, out parsed)) expectedLength = parsed;
+                }
+                else if (key.Equals("SHA256", StringComparison.OrdinalIgnoreCase))
+                {
+                    expectedHash = value;
+                }
+            }
+            if (expectedLength < 0 || string.IsNullOrEmpty(expectedHash))
+            {
+                throw new InvalidDataException("备份完整性信息损坏，已停止恢复。");
+            }
+            VerifyFingerprint(
+                backupPath,
+                new FileFingerprint { Length = expectedLength, Sha256 = expectedHash },
+                "备份完整性校验失败，文件可能已损坏或被修改。");
+            return true;
+        }
+
+        private static FileFingerprint GetFingerprint(string path)
+        {
+            using (var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                4096,
+                FileOptions.SequentialScan))
+            using (var sha256 = SHA256.Create())
+            {
+                var length = stream.Length;
+                var hash = sha256.ComputeHash(stream);
+                return new FileFingerprint
+                {
+                    Length = length,
+                    Sha256 = BitConverter.ToString(hash).Replace("-", "")
+                };
+            }
+        }
+
+        private static void VerifyFingerprint(string path, FileFingerprint expected, string errorMessage)
+        {
+            var actual = GetFingerprint(path);
+            if (actual.Length != expected.Length ||
+                !string.Equals(actual.Sha256, expected.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException(errorMessage);
+            }
+        }
+
+        private static void VerifyFilesIdentical(string expectedPath, string actualPath, string errorMessage)
+        {
+            VerifyFingerprint(actualPath, GetFingerprint(expectedPath), errorMessage);
+        }
+
+        private static void VerifyFileMatchesText(string path, string expectedText, string errorMessage)
+        {
+            if (!string.Equals(ReadText(path), expectedText, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(errorMessage);
+            }
+        }
+
+        private static void DeleteBackupBundle(string backupPath)
+        {
+            if (string.IsNullOrEmpty(backupPath)) return;
+            if (File.Exists(backupPath))
+            {
+                ClearReadOnly(backupPath);
+                File.Delete(backupPath);
+            }
+            var metadataPath = GetIntegrityMetadataPath(backupPath);
+            if (File.Exists(metadataPath))
+            {
+                ClearReadOnly(metadataPath);
+                File.Delete(metadataPath);
             }
         }
 
@@ -537,6 +928,54 @@ namespace Helldivers2CpuFixer
             if (expected.Refills.HasValue && expected.Refills != actual.Refills)
             {
                 throw new InvalidDataException("num_refills_in_voice 校验不一致。");
+            }
+        }
+
+        private static void EnsureUniqueRequiredKeys(string text, ConfigTarget target)
+        {
+            if (target == null) throw new ArgumentNullException("target");
+            var missing = FindMissingRequiredKeys(text ?? "", target);
+            if (missing.Length > 0)
+            {
+                throw new InvalidDataException("配置文件缺少必要字段：" + missing);
+            }
+            var duplicates = FindDuplicateRequiredKeys(text ?? "", target);
+            if (duplicates.Length > 0)
+            {
+                throw new InvalidDataException("配置文件包含重复字段，无法确定游戏实际采用的值：" + duplicates);
+            }
+        }
+
+        private static void EnsureSafeConfigFile(string path, string description)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                throw new FileNotFoundException(description + "不存在。", path);
+            }
+            var attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint)
+            {
+                throw new IOException(description + "不能是符号链接或其他重解析点。请使用真实文件路径。");
+            }
+            EnsureFileWithinSizeLimit(path, description);
+        }
+
+        private static void EnsureFileWithinSizeLimit(string path, string description)
+        {
+            if (string.IsNullOrEmpty(path)) throw new ArgumentException(description + "路径不能为空。", "path");
+            var length = new FileInfo(path).Length;
+            if (length > MaxConfigFileBytes)
+            {
+                throw new InvalidDataException(description + "超过 16 MB 安全上限，已停止读取。");
+            }
+        }
+
+        private static void EnsureTextWithinSizeLimit(string text, string description)
+        {
+            if (text == null) throw new ArgumentNullException("text");
+            if (Encoding.UTF8.GetByteCount(text) > MaxConfigFileBytes)
+            {
+                throw new InvalidDataException(description + "超过 16 MB 安全上限，已停止处理。");
             }
         }
 
@@ -736,10 +1175,27 @@ namespace Helldivers2CpuFixer
         [STAThread]
         private static void Main()
         {
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.ThreadException += OnThreadException;
-            Application.Run(new MainForm());
+            bool createdNew;
+            using (var instanceMutex = new Mutex(
+                true,
+                @"Local\Helldivers2CpuFixer_553850_v1",
+                out createdNew))
+            {
+                if (!createdNew)
+                {
+                    MessageBox.Show(
+                        "程序已经在运行，请切换到已有窗口。",
+                        "地狱潜兵 CPU 修改器",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.ThreadException += OnThreadException;
+                Application.Run(new MainForm());
+                GC.KeepAlive(instanceMutex);
+            }
         }
 
         private static void OnThreadException(object sender, ThreadExceptionEventArgs e)
@@ -754,6 +1210,17 @@ namespace Helldivers2CpuFixer
 
     internal sealed class MainForm : Form
     {
+        internal const int LayoutPlanLabelWidth = 185;
+        internal const int LayoutBannerAreaHeight = 138;
+        internal const int LayoutPathAreaHeight = 116;
+        internal const int LayoutMainAreaHeight = 410;
+        internal const int LayoutPlanSummaryHeight = 60;
+        internal const int LayoutPlanWarningHeight = 42;
+        internal const int LayoutCommandAreaHeight = 128;
+        internal const int LayoutCommandButtonsHeight = 80;
+        internal const int LayoutCommandColumns = 3;
+        internal const int LayoutCommandRows = 2;
+
         private readonly Color pageColor = Color.FromArgb(243, 246, 250);
         private readonly Color cardColor = Color.White;
         private readonly Color textColor = Color.FromArgb(30, 38, 52);
@@ -790,8 +1257,8 @@ namespace Helldivers2CpuFixer
         internal MainForm()
         {
             Text = "地狱潜兵 CPU 修改器 v" + AppConstants.Version;
-            ClientSize = new Size(1240, 900);
-            MinimumSize = new Size(980, 780);
+            ClientSize = new Size(1240, 960);
+            MinimumSize = new Size(1040, 900);
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96F, 96F);
@@ -817,10 +1284,10 @@ namespace Helldivers2CpuFixer
                 RowCount = 5
             };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 126F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 96F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 350F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 106F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, LayoutBannerAreaHeight));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, LayoutPathAreaHeight));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, LayoutMainAreaHeight));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, LayoutCommandAreaHeight));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
             root.Controls.Add(BuildBanner(), 0, 0);
@@ -913,7 +1380,8 @@ namespace Helldivers2CpuFixer
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132F));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 1F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            // Keep the edit field and its margins intact at high DPI.
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
 
             layout.Controls.Add(MakeTitle("游戏目录"), 0, 0);
             layout.SetColumnSpan(layout.GetControlFromPosition(0, 0), 3);
@@ -965,17 +1433,17 @@ namespace Helldivers2CpuFixer
                 ColumnCount = 3,
                 RowCount = 9
             };
-            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140F));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, LayoutPlanLabelWidth));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 142F));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, LayoutPlanSummaryHeight));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, LayoutPlanWarningHeight));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
             var title = MakeTitle("修改方案");
@@ -987,11 +1455,11 @@ namespace Helldivers2CpuFixer
             planBox.Margin = new Padding(0, 3, 0, 5);
             planBox.Items.AddRange(new object[]
             {
-                "主方案：U9-275HX 稳定 8P",
+                "主方案：U9-275HX 游戏可用 8 线程",
                 "备用：高帧率 10 线程",
                 "备用：激进高帧 12 线程",
                 "备用：低温稳定 6 线程",
-                "备用：只改 CPU 8P",
+                "备用：只改 CPU，可用 8 线程",
                 "恢复常见默认值",
                 "自定义"
             });
@@ -1089,10 +1557,10 @@ namespace Helldivers2CpuFixer
             };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 74F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             layout.Controls.Add(MakeTitle("配置状态"), 0, 0);
 
@@ -1119,25 +1587,32 @@ namespace Helldivers2CpuFixer
             fileStateLabel.ForeColor = cautionColor;
             layout.Controls.Add(fileStateLabel, 0, 4);
 
-            var quickActions = new FlowLayoutPanel
+            var quickActions = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = false,
+                ColumnCount = 3,
+                RowCount = 1,
                 Margin = new Padding(0)
             };
+            quickActions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+            quickActions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34F));
+            quickActions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+            quickActions.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             var checkButton = MakeButton("检测失效", false);
-            checkButton.Width = 112;
+            checkButton.Dock = DockStyle.Fill;
+            checkButton.Margin = new Padding(0, 1, 4, 1);
             checkButton.Click += delegate { SafeUi(delegate { CheckFixStatus(true); }, "检测配置"); };
             var refreshButton = MakeButton("刷新", false);
-            refreshButton.Width = 90;
+            refreshButton.Dock = DockStyle.Fill;
+            refreshButton.Margin = new Padding(4, 1, 4, 1);
             refreshButton.Click += delegate { SafeUi(RefreshAll, "刷新状态"); };
             var restoreButton = MakeButton("恢复备份", false);
-            restoreButton.Width = 112;
+            restoreButton.Dock = DockStyle.Fill;
+            restoreButton.Margin = new Padding(4, 1, 0, 1);
             restoreButton.Click += delegate { SafeUi(RestoreLatestBackup, "恢复备份"); };
-            quickActions.Controls.Add(checkButton);
-            quickActions.Controls.Add(refreshButton);
-            quickActions.Controls.Add(restoreButton);
+            quickActions.Controls.Add(checkButton, 0, 0);
+            quickActions.Controls.Add(refreshButton, 1, 0);
+            quickActions.Controls.Add(restoreButton, 2, 0);
             layout.Controls.Add(quickActions, 0, 5);
 
             var explanation = new Label
@@ -1155,53 +1630,60 @@ namespace Helldivers2CpuFixer
         private Control BuildCommandCard()
         {
             var card = MakeCard();
-            card.Margin = new Padding(4, 2, 4, 10);
+            card.Margin = new Padding(4, 2, 4, 4);
             var layout = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                Padding = new Padding(14, 10, 14, 9),
+                Padding = new Padding(14, 8, 14, 7),
                 ColumnCount = 1,
                 RowCount = 2
             };
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, LayoutCommandButtonsHeight));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            var actions = new FlowLayoutPanel
+            var actions = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = false,
-                AutoScroll = true,
+                ColumnCount = LayoutCommandColumns,
+                RowCount = LayoutCommandRows,
                 Margin = new Padding(0)
             };
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34F));
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+            actions.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
             var applyButton = MakeButton("应用修改", true);
-            applyButton.Width = 132;
+            PrepareCommandButton(applyButton, 0, 0);
             applyButton.Click += delegate { SafeUi(delegate { ApplyChanges(false); }, "应用修改"); };
             var applyLaunchButton = MakeButton("应用修改并启动游戏", true);
-            applyLaunchButton.Width = 210;
+            PrepareCommandButton(applyLaunchButton, 1, 0);
             applyLaunchButton.Click += delegate { SafeUi(delegate { ApplyChanges(true); }, "应用并启动游戏"); };
             var unlockButton = MakeButton("一键解除只读", false);
-            unlockButton.Width = 150;
+            PrepareCommandButton(unlockButton, 2, 0);
             unlockButton.Click += delegate { SafeUi(UnlockSettingsFile, "解除只读"); };
             var folderButton = MakeButton("打开配置目录", false);
-            folderButton.Width = 140;
+            PrepareCommandButton(folderButton, 0, 1);
             folderButton.Click += delegate { SafeUi(OpenSettingsDirectory, "打开配置目录"); };
             var notepadButton = MakeButton("记事本打开", false);
-            notepadButton.Width = 130;
+            PrepareCommandButton(notepadButton, 1, 1);
             notepadButton.Click += delegate { SafeUi(OpenSettingsInNotepad, "打开配置文件"); };
             var diagnosticButton = MakeButton("复制诊断信息", false);
-            diagnosticButton.Width = 145;
+            PrepareCommandButton(diagnosticButton, 2, 1);
             diagnosticButton.Click += delegate { SafeUi(CopyDiagnostics, "复制诊断信息"); };
-            actions.Controls.Add(applyButton);
-            actions.Controls.Add(applyLaunchButton);
-            actions.Controls.Add(unlockButton);
-            actions.Controls.Add(folderButton);
-            actions.Controls.Add(notepadButton);
-            actions.Controls.Add(diagnosticButton);
+            actions.Controls.Add(applyButton, 0, 0);
+            actions.Controls.Add(applyLaunchButton, 1, 0);
+            actions.Controls.Add(unlockButton, 2, 0);
+            actions.Controls.Add(folderButton, 0, 1);
+            actions.Controls.Add(notepadButton, 1, 1);
+            actions.Controls.Add(diagnosticButton, 2, 1);
             layout.Controls.Add(actions, 0, 0);
 
             lockAfterApplyCheck.Text = "修改完成后将配置文件设为只读";
             lockAfterApplyCheck.Dock = DockStyle.Fill;
+            lockAfterApplyCheck.AutoSize = false;
+            lockAfterApplyCheck.TextAlign = ContentAlignment.MiddleLeft;
+            lockAfterApplyCheck.Margin = new Padding(0);
             lockAfterApplyCheck.ForeColor = textColor;
             lockAfterApplyCheck.CheckedChanged += delegate { SaveSettingsQuietly(); };
             tips.SetToolTip(lockAfterApplyCheck, "可降低游戏更新以外的意外覆盖；Steam 更新前如遇问题，可使用“一键解除只读”。");
@@ -1444,46 +1926,59 @@ namespace Helldivers2CpuFixer
                     Warn("配置文件缺少必要字段，已停止修改：" + missing);
                     return;
                 }
-                var newText = ConfigFileOperations.BuildModifiedText(oldText, target);
-                if (newText == oldText)
+                var duplicates = ConfigFileOperations.FindDuplicateRequiredKeys(oldText, target);
+                if (duplicates.Length > 0)
                 {
-                    ConfigFileOperations.VerifyTarget(ini, target);
-                    if (lockAfterApplyCheck.Checked && !ConfigFileOperations.IsReadOnly(ini))
-                    {
-                        ConfigFileOperations.SetReadOnly(ini, true);
-                        Log("配置内容已是目标值，已按设置锁定为只读；未创建重复备份。");
-                    }
-                    else
-                    {
-                        Log("配置已经是目标值，未写入，也未创建重复备份。");
-                    }
-                    SetStatus("配置有效", StatusLevel.Success);
-                    RefreshAll();
-                    if (launchAfter) LaunchGame();
-                    else MessageBox.Show(this, "当前配置已经是目标值，不需要重复修改。", "无需修改", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    Warn("配置文件包含重复字段，无法确定游戏实际采用的值，已停止修改：" + duplicates);
                     return;
                 }
-
-                var preview = BuildPreview(oldText, target, ini);
-                if (MessageBox.Show(this, preview, "确认修改", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                var newText = ConfigFileOperations.BuildModifiedText(oldText, target);
+                if (newText != oldText)
                 {
-                    Log("已取消，没有修改配置文件。");
+                    var preview = BuildPreview(oldText, target, ini);
+                    if (MessageBox.Show(this, preview, "确认修改", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                    {
+                        Log("已取消，没有修改配置文件。");
+                        return;
+                    }
+                }
+
+                if (IsGameRunning())
+                {
+                    Warn("确认期间检测到游戏已经启动。为避免配置竞争，本次操作已安全取消。");
                     return;
                 }
 
                 var result = ConfigFileOperations.ApplySafely(
                     ini,
+                    oldText,
                     newText,
                     target,
                     lockAfterApplyCheck.Checked,
                     null);
-                Log("修改完成并通过两次校验。备份：" + Path.GetFileName(result.BackupPath));
+                if (result.Changed)
+                {
+                    Log("修改完成并通过完整性校验。备份：" + Path.GetFileName(result.BackupPath));
+                }
+                else if (lockAfterApplyCheck.Checked)
+                {
+                    Log("配置内容已是目标值，已确认只读状态；未创建重复备份。");
+                }
+                else
+                {
+                    Log("配置已经是目标值，未写入，也未创建重复备份。");
+                }
                 if (!string.IsNullOrEmpty(result.MaintenanceWarning)) Log(result.MaintenanceWarning);
                 lastErrorMessage = "无";
                 SetStatus("配置有效", StatusLevel.Success);
                 RefreshAll();
                 if (launchAfter) LaunchGame();
-                else MessageBox.Show(this, "修改成功，配置已校验。", "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                else MessageBox.Show(
+                    this,
+                    result.Changed ? "修改成功，配置已通过完整性校验。" : "当前配置已经是目标值，不需要重复修改。",
+                    result.Changed ? "完成" : "无需修改",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -1516,7 +2011,7 @@ namespace Helldivers2CpuFixer
             preview.AppendLine();
             preview.AppendLine("文件：" + ini);
             preview.AppendLine();
-            preview.Append("程序会先备份，再通过同目录临时文件校验和安全替换；失败时自动回滚。");
+            preview.Append("程序会记录原文件完整性指纹，确认后如文件发生变化会安全停止；写入失败时自动回滚。");
             if (lockAfterApplyCheck.Checked) preview.Append(" 成功后会设为只读。");
             return preview.ToString();
         }
@@ -1535,6 +2030,22 @@ namespace Helldivers2CpuFixer
             try
             {
                 var target = GetTarget();
+                string validationError;
+                if (!ValidateTarget(target, out validationError))
+                {
+                    lastDetectionResult = "目标参数无效：" + validationError;
+                    SetStatus("未选择修改项", StatusLevel.Warning);
+                    if (showMessage)
+                    {
+                        MessageBox.Show(
+                            this,
+                            validationError,
+                            "无法检测",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                    }
+                    return;
+                }
                 var text = ConfigFileOperations.ReadText(ini);
                 var missing = ConfigFileOperations.FindMissingRequiredKeys(text, target);
                 if (missing.Length > 0)
@@ -1542,6 +2053,14 @@ namespace Helldivers2CpuFixer
                     lastDetectionResult = "配置缺少字段：" + missing;
                     SetStatus("配置无效", StatusLevel.Error);
                     if (showMessage) Warn("配置文件缺少必要字段，无法检测：" + missing);
+                    return;
+                }
+                var duplicates = ConfigFileOperations.FindDuplicateRequiredKeys(text, target);
+                if (duplicates.Length > 0)
+                {
+                    lastDetectionResult = "配置包含重复字段：" + duplicates;
+                    SetStatus("配置有歧义", StatusLevel.Error);
+                    if (showMessage) Warn("配置文件包含重复字段，无法可靠检测：" + duplicates);
                     return;
                 }
 
@@ -1631,17 +2150,28 @@ namespace Helldivers2CpuFixer
                 }
                 if (MessageBox.Show(
                     this,
-                    "恢复最近备份吗？\r\n\r\n" + latest + "\r\n\r\n恢复过程会先创建临时保护副本并校验关键参数。",
+                    "恢复最近备份吗？\r\n\r\n" + latest +
+                    "\r\n\r\n程序会永久保留恢复前配置，并对整个文件进行完整性校验。",
                     "确认恢复",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Question) != DialogResult.Yes)
                 {
                     return;
                 }
-
-                ConfigFileOperations.RestoreBackupSafely(latest, ini, null);
+                if (IsGameRunning())
+                {
+                    Warn("确认期间检测到游戏已经启动。为避免配置竞争，本次恢复已安全取消。");
+                    return;
+                }
+                var result = ConfigFileOperations.RestoreBackupSafely(latest, ini, null);
                 lastErrorMessage = "无";
                 Log("已恢复并校验最近备份：" + Path.GetFileName(latest));
+                Log("恢复前配置已永久保留：" + Path.GetFileName(result.PreRestoreBackupPath));
+                if (result.LegacyBackupWithoutIntegrityMetadata)
+                {
+                    Log("提示：所选为旧版备份，无完整性元数据；已校验三个必要参数和恢复后的完整文件。");
+                }
+                if (!string.IsNullOrEmpty(result.MaintenanceWarning)) Log(result.MaintenanceWarning);
                 SetStatus("备份已恢复", StatusLevel.Success);
                 RefreshAll();
                 MessageBox.Show(this, "最近备份已恢复并校验。", "恢复完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1873,7 +2403,12 @@ namespace Helldivers2CpuFixer
             var available = logical - reserved;
             threadSummaryLabel.Text = "CPU 逻辑线程：" + logical + "  |  当前保留：" + reserved + "\r\n" +
                                       "游戏预计可用线程：" + available;
-            if (cpuCheck.Checked && available < 4)
+            if (!cpuCheck.Checked && !audioCheck.Checked)
+            {
+                safetyWarningLabel.Text = "请选择至少一个要修改或检测的项目。";
+                safetyWarningLabel.ForeColor = cautionColor;
+            }
+            else if (cpuCheck.Checked && available < 4)
             {
                 safetyWarningLabel.Text = "禁止应用：必须至少给游戏保留 4 个可用线程。";
                 safetyWarningLabel.ForeColor = errorColor;
@@ -1890,30 +2425,9 @@ namespace Helldivers2CpuFixer
             }
         }
 
-        private bool ValidateTarget(ConfigTarget target, out string error)
+        internal static bool ValidateTarget(ConfigTarget target, out string error)
         {
-            if (!target.ModifyCpu && !target.ModifyAudio)
-            {
-                error = "至少勾选一个要修改的项目。";
-                return false;
-            }
-            if (target.ModifyCpu)
-            {
-                var logical = Environment.ProcessorCount;
-                if (target.ReservedThreads >= logical)
-                {
-                    error = "保留线程数必须小于 CPU 逻辑线程总数（" + logical + "）。";
-                    return false;
-                }
-                var available = logical - target.ReservedThreads;
-                if (available < 4)
-                {
-                    error = "该设置只给游戏留下 " + available + " 个线程。为避免无法运行或严重卡顿，至少需要 4 个可用线程。";
-                    return false;
-                }
-            }
-            error = null;
-            return true;
+            return ConfigFileOperations.ValidateTarget(target, Environment.ProcessorCount, out error);
         }
 
         private bool IsAggressiveTarget(ConfigTarget target)
@@ -2048,27 +2562,42 @@ namespace Helldivers2CpuFixer
                 Dock = DockStyle.Fill,
                 ForeColor = mutedColor,
                 TextAlign = ContentAlignment.MiddleLeft,
-                AutoEllipsis = true
+                AutoEllipsis = false,
+                Padding = new Padding(0, 0, 8, 0)
             };
+        }
+
+        private static void PrepareCommandButton(Button button, int column, int row)
+        {
+            button.Dock = DockStyle.Fill;
+            button.Margin = new Padding(
+                column == 0 ? 0 : 4,
+                row == 0 ? 1 : 4,
+                column == LayoutCommandColumns - 1 ? 0 : 4,
+                row == LayoutCommandRows - 1 ? 1 : 4);
         }
 
         private Button MakeButton(string text, bool primary)
         {
-            var button = new Button
+            var button = new ActionButton
             {
                 Text = text,
-                Height = 31,
+                Height = 35,
+                MinimumSize = new Size(0, 35),
                 AutoSize = false,
+                AutoEllipsis = true,
                 FlatStyle = FlatStyle.Flat,
                 Cursor = Cursors.Hand,
-                Margin = new Padding(0, 1, 8, 1)
+                Margin = new Padding(0, 1, 8, 1),
+                Padding = new Padding(2, 1, 2, 1),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = CreateButtonFont(9F, primary ? FontStyle.Bold : FontStyle.Regular)
             };
             if (primary)
             {
                 button.BackColor = accentColor;
                 button.ForeColor = Color.White;
                 button.FlatAppearance.BorderSize = 0;
-                button.Font = CreateUiFont(9F, FontStyle.Bold);
             }
             else
             {
@@ -2137,7 +2666,8 @@ namespace Helldivers2CpuFixer
                     var installDir = "Helldivers 2";
                     var match = Regex.Match(manifestText, "\"installdir\"\\s+\"([^\"]+)\"");
                     if (match.Success) installDir = match.Groups[1].Value;
-                    var candidate = Path.Combine(library, "steamapps", "common", installDir);
+                    var candidate = CombineSteamInstallPath(library, installDir);
+                    if (candidate == null) continue;
                     if (Directory.Exists(candidate)) return candidate;
                 }
             }
@@ -2145,6 +2675,23 @@ namespace Helldivers2CpuFixer
             {
             }
             return null;
+        }
+
+        internal static string CombineSteamInstallPath(string library, string installDir)
+        {
+            if (string.IsNullOrWhiteSpace(library) || string.IsNullOrWhiteSpace(installDir)) return null;
+            try
+            {
+                var commonRoot = Path.GetFullPath(Path.Combine(library, "steamapps", "common"));
+                var candidate = Path.GetFullPath(Path.Combine(commonRoot, installDir));
+                var rootPrefix = commonRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                                 Path.DirectorySeparatorChar;
+                return candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) ? candidate : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static string GetSteamPath()
@@ -2209,13 +2756,35 @@ namespace Helldivers2CpuFixer
             return RedactDiagnosticText(path);
         }
 
-        private static string RedactDiagnosticText(string text)
+        internal static string RedactDiagnosticText(string text)
         {
             if (string.IsNullOrEmpty(text)) return text;
             var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            return string.IsNullOrEmpty(profile)
+            var redacted = string.IsNullOrEmpty(profile)
                 ? text
-                : text.Replace(profile, "%USERPROFILE%");
+                : Regex.Replace(text, Regex.Escape(profile), "%USERPROFILE%", RegexOptions.IgnoreCase);
+            var userName = Environment.UserName;
+            if (!string.IsNullOrEmpty(userName))
+            {
+                redacted = Regex.Replace(
+                    redacted,
+                    @"(?<=\\|/)" + Regex.Escape(userName) + @"(?=\\|/|$)",
+                    "%USERNAME%",
+                    RegexOptions.IgnoreCase);
+            }
+            return redacted;
+        }
+
+        private static Font CreateButtonFont(float size, FontStyle style)
+        {
+            try
+            {
+                return new Font("Microsoft YaHei UI", size, style);
+            }
+            catch
+            {
+                return CreateUiFont(size, style);
+            }
         }
 
         private static string EstimatedAvailable(int? reserved)
@@ -2255,6 +2824,65 @@ namespace Helldivers2CpuFixer
         private static int Clamp(int value, int minimum, int maximum)
         {
             return Math.Max(minimum, Math.Min(maximum, value));
+        }
+    }
+
+    internal sealed class ActionButton : Button
+    {
+        internal ActionButton()
+        {
+            SetStyle(
+                ControlStyles.UserPaint |
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer,
+                true);
+            DoubleBuffered = true;
+            UseVisualStyleBackColor = false;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var bounds = ClientRectangle;
+            var background = Enabled ? BackColor : Color.FromArgb(235, 238, 242);
+            using (var brush = new SolidBrush(background))
+            {
+                e.Graphics.FillRectangle(brush, bounds);
+            }
+
+            if (FlatAppearance.BorderSize > 0)
+            {
+                var borderColor = FlatAppearance.BorderColor.IsEmpty
+                    ? Color.FromArgb(204, 213, 226)
+                    : FlatAppearance.BorderColor;
+                using (var pen = new Pen(borderColor, FlatAppearance.BorderSize))
+                {
+                    var border = bounds;
+                    border.Width--;
+                    border.Height--;
+                    e.Graphics.DrawRectangle(pen, border);
+                }
+            }
+
+            var textBounds = Rectangle.FromLTRB(
+                Padding.Left,
+                Padding.Top,
+                Math.Max(Padding.Left, bounds.Right - Padding.Right),
+                Math.Max(Padding.Top, bounds.Bottom - Padding.Bottom));
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                Font,
+                textBounds,
+                Enabled ? ForeColor : Color.FromArgb(130, 138, 148),
+                TextFormatFlags.HorizontalCenter |
+                TextFormatFlags.VerticalCenter |
+                TextFormatFlags.SingleLine |
+                TextFormatFlags.EndEllipsis);
+
+            if (Focused)
+            {
+                ControlPaint.DrawFocusRectangle(e.Graphics, textBounds);
+            }
         }
     }
 
