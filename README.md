@@ -1,6 +1,6 @@
 # Helldivers 2 CPU Config Tool
 
-《地狱潜兵 2》本地配置调整工具。v1.6.9 只读取和修改游戏目录中的 `data/settings.ini`，不注入进程、不修改游戏内存、不结束游戏或反作弊进程，也不联网。
+《地狱潜兵 2》本地配置调整工具。v1.6.10 只读取和修改游戏目录中的 `data/settings.ini`，不注入进程、不修改游戏内存、不结束游戏或反作弊进程，也不联网。
 
 ## 主要功能
 
@@ -18,6 +18,7 @@
 - 恢复前永久保留当前配置，并对恢复文件执行完整文件校验。
 - 支持打开配置目录、记事本打开和复制脱敏诊断信息。
 - 高 DPI 界面为横幅、路径输入和两行命令网格保留最低可用高度；命令按钮只进行一次文本绘制，避免 Windows Forms 的中文文字叠画或丢失。
+- 对抗性防护：拒绝重复必要字段、越界参数、超过 16 MB 的配置、重解析点文件和逃出 Steam 库目录的安装路径。
 
 ## 使用与构建
 
@@ -25,7 +26,7 @@
 - 主源码：[work/Helldivers2CpuFixer.cs](work/Helldivers2CpuFixer.cs)
 - 集成测试：[work/Helldivers2CpuFixer.Tests.cs](work/Helldivers2CpuFixer.Tests.cs)
 - DPI 清单：[work/app.manifest](work/app.manifest)
-- 构建说明：[work/构建说明_v1.6.9.txt](work/构建说明_v1.6.9.txt)
+- 构建说明：[work/构建说明_v1.6.10.txt](work/构建说明_v1.6.10.txt)
 
 ## 重要提示
 

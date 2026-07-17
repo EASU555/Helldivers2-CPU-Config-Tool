@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Local User Tool")]
 [assembly: AssemblyProduct("Helldivers 2 CPU Config Tool")]
 [assembly: AssemblyCopyright("Local User")]
-[assembly: AssemblyVersion("1.6.9.0")]
-[assembly: AssemblyFileVersion("1.6.9.0")]
+[assembly: AssemblyVersion("1.6.10.0")]
+[assembly: AssemblyFileVersion("1.6.10.0")]
 
 namespace Helldivers2CpuFixer
 {
@@ -26,7 +26,7 @@ namespace Helldivers2CpuFixer
     {
         internal const string AppId = "553850";
         internal const string SteamLaunchUri = "steam://rungameid/553850";
-        internal const string Version = "1.6.9";
+        internal const string Version = "1.6.10";
         internal const string ThreadsPattern = @"(?im)^\s*num[\s_]+reserved[\s_]+threads\s*=\s*(\d+)";
         internal const string ThreadsReplacePattern = @"(?im)^(\s*num[\s_]+reserved[\s_]+threads\s*=\s*)\d+([^\r\n]*)";
         internal const string MemoryPattern = @"(?im)^\s*memory_size\s*=\s*(\d+)";
@@ -103,6 +103,13 @@ namespace Helldivers2CpuFixer
 
     internal static class ConfigFileOperations
     {
+        internal const long MaxConfigFileBytes = 16L * 1024L * 1024L;
+        internal const int MinimumMemorySize = 1 * 1024 * 1024;
+        internal const int MaximumMemorySize = 512 * 1024 * 1024;
+        internal const int MinimumRefills = 1;
+        internal const int MaximumRefills = 16;
+        internal const int MinimumAvailableThreads = 4;
+
         private sealed class FileFingerprint
         {
             internal long Length;
@@ -111,6 +118,7 @@ namespace Helldivers2CpuFixer
 
         internal static string ReadText(string path)
         {
+            EnsureFileWithinSizeLimit(path, "文本文件");
             return File.ReadAllText(path, Encoding.UTF8);
         }
 
@@ -162,9 +170,79 @@ namespace Helldivers2CpuFixer
             return string.Join("、", missing.ToArray());
         }
 
+        internal static string FindDuplicateRequiredKeys(string text, ConfigTarget target)
+        {
+            if (target == null) throw new ArgumentNullException("target");
+            var duplicates = new List<string>();
+            if (target.ModifyCpu && Regex.Matches(text ?? "", AppConstants.ThreadsPattern).Count > 1)
+            {
+                duplicates.Add("num_reserved_threads");
+            }
+            if (target.ModifyAudio && Regex.Matches(text ?? "", AppConstants.MemoryPattern).Count > 1)
+            {
+                duplicates.Add("memory_size");
+            }
+            if (target.ModifyAudio && Regex.Matches(text ?? "", AppConstants.RefillsPattern).Count > 1)
+            {
+                duplicates.Add("num_refills_in_voice");
+            }
+            return string.Join("、", duplicates.ToArray());
+        }
+
+        internal static bool ValidateTarget(ConfigTarget target, int logicalThreads, out string error)
+        {
+            if (target == null)
+            {
+                error = "目标参数不能为空。";
+                return false;
+            }
+            if (!target.ModifyCpu && !target.ModifyAudio)
+            {
+                error = "至少勾选一个要修改的项目。";
+                return false;
+            }
+            if (target.ModifyCpu)
+            {
+                if (target.ReservedThreads < 0)
+                {
+                    error = "保留线程数不能为负数。";
+                    return false;
+                }
+                logicalThreads = Math.Max(1, logicalThreads);
+                if (target.ReservedThreads >= logicalThreads)
+                {
+                    error = "保留线程数必须小于 CPU 逻辑线程总数（" + logicalThreads + "）。";
+                    return false;
+                }
+                var available = logicalThreads - target.ReservedThreads;
+                if (available < MinimumAvailableThreads)
+                {
+                    error = "该设置只给游戏留下 " + available + " 个线程。为避免无法运行或严重卡顿，至少需要 " + MinimumAvailableThreads + " 个可用线程。";
+                    return false;
+                }
+            }
+            if (target.ModifyAudio)
+            {
+                if (target.MemorySize < MinimumMemorySize || target.MemorySize > MaximumMemorySize)
+                {
+                    error = "音频缓存必须在 1 MB 到 512 MB 之间。";
+                    return false;
+                }
+                if (target.Refills < MinimumRefills || target.Refills > MaximumRefills)
+                {
+                    error = "音频缓冲补充次数必须在 1 到 16 之间。";
+                    return false;
+                }
+            }
+            error = null;
+            return true;
+        }
+
         internal static void VerifyTarget(string path, ConfigTarget target)
         {
-            var current = ReadSnapshot(path);
+            var text = ReadText(path);
+            EnsureUniqueRequiredKeys(text, target);
+            var current = ParseSnapshot(text);
             if (target.ModifyCpu && current.ReservedThreads != target.ReservedThreads)
             {
                 throw new InvalidOperationException("num_reserved_threads 未变成目标值。");
@@ -193,6 +271,17 @@ namespace Helldivers2CpuFixer
             }
             if (expectedOriginalText == null) throw new ArgumentNullException("expectedOriginalText");
             if (newText == null) throw new ArgumentNullException("newText");
+
+            string validationError;
+            if (!ValidateTarget(target, Environment.ProcessorCount, out validationError))
+            {
+                throw new ArgumentOutOfRangeException("target", validationError);
+            }
+            EnsureSafeConfigFile(path, "配置文件");
+            EnsureTextWithinSizeLimit(expectedOriginalText, "原配置内容");
+            EnsureTextWithinSizeLimit(newText, "目标配置内容");
+            EnsureUniqueRequiredKeys(expectedOriginalText, target);
+            EnsureUniqueRequiredKeys(newText, target);
 
             VerifyFileMatchesText(path, expectedOriginalText, "配置文件已被其他程序修改，请刷新后重新确认。");
             if (newText == expectedOriginalText)
@@ -315,6 +404,7 @@ namespace Helldivers2CpuFixer
                 {
                     if (File.Exists(path))
                     {
+                        EnsureSafeConfigFile(path, "配置文件");
                         File.SetAttributes(path, originalAttributes);
                     }
                 }
@@ -387,11 +477,28 @@ namespace Helldivers2CpuFixer
                 throw new FileNotFoundException("目标配置文件不存在。", targetPath);
             }
 
+            EnsureSafeConfigFile(backupPath, "备份文件");
+            EnsureSafeConfigFile(targetPath, "目标配置文件");
             var originalAttributes = File.GetAttributes(targetPath);
-            var backupSnapshot = ReadSnapshot(backupPath);
+            var backupText = ReadText(backupPath);
+            var restoreTarget = new ConfigTarget
+            {
+                ModifyCpu = true,
+                ModifyAudio = true
+            };
+            EnsureUniqueRequiredKeys(backupText, restoreTarget);
+            var backupSnapshot = ParseSnapshot(backupText);
             if (!backupSnapshot.HasAllValues)
             {
                 throw new InvalidDataException("备份文件缺少一个或多个必要参数，可能已损坏或截断，已停止恢复。");
+            }
+            restoreTarget.ReservedThreads = backupSnapshot.ReservedThreads.Value;
+            restoreTarget.MemorySize = backupSnapshot.MemorySize.Value;
+            restoreTarget.Refills = backupSnapshot.Refills.Value;
+            string validationError;
+            if (!ValidateTarget(restoreTarget, Environment.ProcessorCount, out validationError))
+            {
+                throw new InvalidDataException("备份参数超出安全范围，已停止恢复：" + validationError);
             }
             var legacyBackup = !ValidateBackupIntegrityMetadata(backupPath);
             var backupFingerprint = GetFingerprint(backupPath);
@@ -484,6 +591,7 @@ namespace Helldivers2CpuFixer
                 {
                     if (File.Exists(targetPath))
                     {
+                        EnsureSafeConfigFile(targetPath, "目标配置文件");
                         File.SetAttributes(targetPath, originalAttributes);
                     }
                 }
@@ -560,6 +668,7 @@ namespace Helldivers2CpuFixer
 
         internal static void SetReadOnly(string path, bool readOnly)
         {
+            EnsureSafeConfigFile(path, "配置文件");
             var attributes = File.GetAttributes(path);
             var updated = readOnly
                 ? attributes | FileAttributes.ReadOnly
@@ -569,6 +678,7 @@ namespace Helldivers2CpuFixer
 
         internal static bool IsReadOnly(string path)
         {
+            EnsureSafeConfigFile(path, "配置文件");
             return (File.GetAttributes(path) & FileAttributes.ReadOnly) == FileAttributes.ReadOnly;
         }
 
@@ -653,6 +763,7 @@ namespace Helldivers2CpuFixer
 
         private static void WriteTextDurable(string path, string text)
         {
+            EnsureTextWithinSizeLimit(text, "待写入内容");
             var bytes = new UTF8Encoding(false).GetBytes(text);
             using (var stream = new FileStream(
                 path,
@@ -712,6 +823,7 @@ namespace Helldivers2CpuFixer
         {
             var metadataPath = GetIntegrityMetadataPath(backupPath);
             if (!File.Exists(metadataPath)) return false;
+            EnsureSafeConfigFile(metadataPath, "备份完整性信息");
 
             long expectedLength = -1;
             string expectedHash = null;
@@ -816,6 +928,54 @@ namespace Helldivers2CpuFixer
             if (expected.Refills.HasValue && expected.Refills != actual.Refills)
             {
                 throw new InvalidDataException("num_refills_in_voice 校验不一致。");
+            }
+        }
+
+        private static void EnsureUniqueRequiredKeys(string text, ConfigTarget target)
+        {
+            if (target == null) throw new ArgumentNullException("target");
+            var missing = FindMissingRequiredKeys(text ?? "", target);
+            if (missing.Length > 0)
+            {
+                throw new InvalidDataException("配置文件缺少必要字段：" + missing);
+            }
+            var duplicates = FindDuplicateRequiredKeys(text ?? "", target);
+            if (duplicates.Length > 0)
+            {
+                throw new InvalidDataException("配置文件包含重复字段，无法确定游戏实际采用的值：" + duplicates);
+            }
+        }
+
+        private static void EnsureSafeConfigFile(string path, string description)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                throw new FileNotFoundException(description + "不存在。", path);
+            }
+            var attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint)
+            {
+                throw new IOException(description + "不能是符号链接或其他重解析点。请使用真实文件路径。");
+            }
+            EnsureFileWithinSizeLimit(path, description);
+        }
+
+        private static void EnsureFileWithinSizeLimit(string path, string description)
+        {
+            if (string.IsNullOrEmpty(path)) throw new ArgumentException(description + "路径不能为空。", "path");
+            var length = new FileInfo(path).Length;
+            if (length > MaxConfigFileBytes)
+            {
+                throw new InvalidDataException(description + "超过 16 MB 安全上限，已停止读取。");
+            }
+        }
+
+        private static void EnsureTextWithinSizeLimit(string text, string description)
+        {
+            if (text == null) throw new ArgumentNullException("text");
+            if (Encoding.UTF8.GetByteCount(text) > MaxConfigFileBytes)
+            {
+                throw new InvalidDataException(description + "超过 16 MB 安全上限，已停止处理。");
             }
         }
 
@@ -1766,6 +1926,12 @@ namespace Helldivers2CpuFixer
                     Warn("配置文件缺少必要字段，已停止修改：" + missing);
                     return;
                 }
+                var duplicates = ConfigFileOperations.FindDuplicateRequiredKeys(oldText, target);
+                if (duplicates.Length > 0)
+                {
+                    Warn("配置文件包含重复字段，无法确定游戏实际采用的值，已停止修改：" + duplicates);
+                    return;
+                }
                 var newText = ConfigFileOperations.BuildModifiedText(oldText, target);
                 if (newText != oldText)
                 {
@@ -1889,6 +2055,14 @@ namespace Helldivers2CpuFixer
                     if (showMessage) Warn("配置文件缺少必要字段，无法检测：" + missing);
                     return;
                 }
+                var duplicates = ConfigFileOperations.FindDuplicateRequiredKeys(text, target);
+                if (duplicates.Length > 0)
+                {
+                    lastDetectionResult = "配置包含重复字段：" + duplicates;
+                    SetStatus("配置有歧义", StatusLevel.Error);
+                    if (showMessage) Warn("配置文件包含重复字段，无法可靠检测：" + duplicates);
+                    return;
+                }
 
                 var current = ConfigFileOperations.ParseSnapshot(text);
                 var differences = new List<string>();
@@ -1984,7 +2158,6 @@ namespace Helldivers2CpuFixer
                 {
                     return;
                 }
-
                 if (IsGameRunning())
                 {
                     Warn("确认期间检测到游戏已经启动。为避免配置竞争，本次恢复已安全取消。");
@@ -2254,28 +2427,7 @@ namespace Helldivers2CpuFixer
 
         internal static bool ValidateTarget(ConfigTarget target, out string error)
         {
-            if (!target.ModifyCpu && !target.ModifyAudio)
-            {
-                error = "至少勾选一个要修改的项目。";
-                return false;
-            }
-            if (target.ModifyCpu)
-            {
-                var logical = Environment.ProcessorCount;
-                if (target.ReservedThreads >= logical)
-                {
-                    error = "保留线程数必须小于 CPU 逻辑线程总数（" + logical + "）。";
-                    return false;
-                }
-                var available = logical - target.ReservedThreads;
-                if (available < 4)
-                {
-                    error = "该设置只给游戏留下 " + available + " 个线程。为避免无法运行或严重卡顿，至少需要 4 个可用线程。";
-                    return false;
-                }
-            }
-            error = null;
-            return true;
+            return ConfigFileOperations.ValidateTarget(target, Environment.ProcessorCount, out error);
         }
 
         private bool IsAggressiveTarget(ConfigTarget target)
@@ -2514,7 +2666,8 @@ namespace Helldivers2CpuFixer
                     var installDir = "Helldivers 2";
                     var match = Regex.Match(manifestText, "\"installdir\"\\s+\"([^\"]+)\"");
                     if (match.Success) installDir = match.Groups[1].Value;
-                    var candidate = Path.Combine(library, "steamapps", "common", installDir);
+                    var candidate = CombineSteamInstallPath(library, installDir);
+                    if (candidate == null) continue;
                     if (Directory.Exists(candidate)) return candidate;
                 }
             }
@@ -2522,6 +2675,23 @@ namespace Helldivers2CpuFixer
             {
             }
             return null;
+        }
+
+        internal static string CombineSteamInstallPath(string library, string installDir)
+        {
+            if (string.IsNullOrWhiteSpace(library) || string.IsNullOrWhiteSpace(installDir)) return null;
+            try
+            {
+                var commonRoot = Path.GetFullPath(Path.Combine(library, "steamapps", "common"));
+                var candidate = Path.GetFullPath(Path.Combine(commonRoot, installDir));
+                var rootPrefix = commonRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                                 Path.DirectorySeparatorChar;
+                return candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) ? candidate : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static string GetSteamPath()

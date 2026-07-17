@@ -52,13 +52,13 @@ namespace Helldivers2CpuFixer.Tests
             var defaultText = MakeText(2, 26214400, 2);
             File.WriteAllText(ini, defaultText, new UTF8Encoding(false));
 
-            var stable = Target(16, 78643200, 4);
+            var stable = Target(Math.Min(16, Math.Max(0, Environment.ProcessorCount - 4)), 78643200, 4);
             var stableText = ConfigFileOperations.BuildModifiedText(defaultText, stable);
             var apply = ConfigFileOperations.ApplySafely(ini, defaultText, stableText, stable, false, null);
             Assert(File.Exists(apply.BackupPath), "修改前创建精确时间备份");
             Assert(File.Exists(apply.BackupPath + ".integrity"), "新备份创建完整性元数据");
             Assert(File.ReadAllText(ini, Encoding.UTF8) == stableText, "应用后整个配置文件与已校验内容完全一致");
-            AssertSnapshot(ini, 16, 78643200, 4, "临时文件校验后安全替换并再次校验");
+            AssertSnapshot(ini, stable.ReservedThreads, 78643200, 4, "临时文件校验后安全替换并再次校验");
             Assert(!ConfigFileOperations.IsReadOnly(ini), "普通文件修改后保持原始可写属性");
 
             var backupCount = ConfigFileOperations.GetBackups(ini).Length;
@@ -191,6 +191,73 @@ namespace Helldivers2CpuFixer.Tests
                 ConfigFileOperations.GetBackups(ini).Length == backupsBeforeStaleAttempt,
                 "旧快照被拒绝时不留下冗余备份");
 
+            var duplicateOriginal = defaultText + "num_reserved_threads = 7\r\n";
+            File.WriteAllText(ini, duplicateOriginal, new UTF8Encoding(false));
+            var duplicateTargetText = ConfigFileOperations.BuildModifiedText(duplicateOriginal, stable);
+            var backupsBeforeDuplicateAttempt = ConfigFileOperations.GetBackups(ini).Length;
+            var duplicateRejected = false;
+            try
+            {
+                ConfigFileOperations.ApplySafely(
+                    ini,
+                    duplicateOriginal,
+                    duplicateTargetText,
+                    stable,
+                    false,
+                    null);
+            }
+            catch (InvalidDataException ex)
+            {
+                duplicateRejected = ex.Message.Contains("重复字段");
+            }
+            Assert(duplicateRejected, "重复必要字段时拒绝写入");
+            Assert(File.ReadAllText(ini, Encoding.UTF8) == duplicateOriginal, "拒绝重复字段后保持配置不变");
+            Assert(
+                ConfigFileOperations.GetBackups(ini).Length == backupsBeforeDuplicateAttempt,
+                "重复字段被拒绝时不创建备份");
+
+            File.WriteAllText(ini, defaultText, new UTF8Encoding(false));
+            var invalidAudio = new ConfigTarget
+            {
+                ModifyAudio = true,
+                MemorySize = 0,
+                Refills = 0
+            };
+            var invalidAudioText = ConfigFileOperations.BuildModifiedText(defaultText, invalidAudio);
+            var invalidTargetRejected = false;
+            try
+            {
+                ConfigFileOperations.ApplySafely(
+                    ini,
+                    defaultText,
+                    invalidAudioText,
+                    invalidAudio,
+                    false,
+                    null);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                invalidTargetRejected = true;
+            }
+            Assert(invalidTargetRejected, "底层写入接口拒绝越界音频参数");
+            Assert(File.ReadAllText(ini, Encoding.UTF8) == defaultText, "越界参数被拒绝时不修改配置");
+
+            var oversizedPath = Path.Combine(dataDir, "oversized.ini");
+            using (var oversized = new FileStream(oversizedPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                oversized.SetLength(ConfigFileOperations.MaxConfigFileBytes + 1);
+            }
+            var oversizedRejected = false;
+            try
+            {
+                ConfigFileOperations.ReadText(oversizedPath);
+            }
+            catch (InvalidDataException ex)
+            {
+                oversizedRejected = ex.Message.Contains("16 MB");
+            }
+            Assert(oversizedRejected, "超过安全上限的配置文件被拒绝读取");
+
             File.WriteAllText(ini, defaultText, new UTF8Encoding(false));
             var backupsBeforeInjectedFailures = ConfigFileOperations.GetBackups(ini).Length;
             for (var failureIndex = 0; failureIndex < 12; failureIndex++)
@@ -232,6 +299,38 @@ namespace Helldivers2CpuFixer.Tests
             Assert(
                 File.ReadAllText(ini, Encoding.UTF8) == beforePartialRestore,
                 "拒绝截断备份后保持当前配置不变");
+
+            var duplicateBackup = ini + ".bak_29990101_000001_000_duplicate";
+            File.WriteAllText(
+                duplicateBackup,
+                defaultText + "memory_size = 78643200\r\n",
+                new UTF8Encoding(false));
+            var beforeDuplicateRestore = File.ReadAllText(ini, Encoding.UTF8);
+            var duplicateBackupRejected = false;
+            try
+            {
+                ConfigFileOperations.RestoreBackupSafely(duplicateBackup, ini, null);
+            }
+            catch (InvalidDataException ex)
+            {
+                duplicateBackupRejected = ex.Message.Contains("重复字段");
+            }
+            Assert(duplicateBackupRejected, "包含重复必要字段的备份被拒绝恢复");
+            Assert(File.ReadAllText(ini, Encoding.UTF8) == beforeDuplicateRestore, "拒绝歧义备份后保持当前配置不变");
+
+            var unsafeBackup = ini + ".bak_29990101_000002_000_unsafe";
+            File.WriteAllText(unsafeBackup, MakeText(2, 0, 2), new UTF8Encoding(false));
+            var unsafeBackupRejected = false;
+            try
+            {
+                ConfigFileOperations.RestoreBackupSafely(unsafeBackup, ini, null);
+            }
+            catch (InvalidDataException ex)
+            {
+                unsafeBackupRejected = ex.Message.Contains("安全范围");
+            }
+            Assert(unsafeBackupRejected, "参数越界的备份被拒绝恢复");
+            Assert(File.ReadAllText(ini, Encoding.UTF8) == beforeDuplicateRestore, "拒绝越界备份后保持当前配置不变");
 
             File.AppendAllText(apply.BackupPath, "# tampered\r\n", new UTF8Encoding(false));
             var tamperedRejected = false;
@@ -297,7 +396,7 @@ namespace Helldivers2CpuFixer.Tests
 
         private static void RunStaticContractTests(string root)
         {
-            Assert(AppConstants.Version == "1.6.9", "工具版本为 v1.6.9");
+            Assert(AppConstants.Version == "1.6.10", "工具版本为 v1.6.10");
             Assert(
                 MainForm.LayoutPlanLabelWidth >= 185 &&
                 MainForm.LayoutBannerAreaHeight >= 138 &&
@@ -322,6 +421,20 @@ namespace Helldivers2CpuFixer.Tests
                 !MainForm.ValidateTarget(new ConfigTarget(), out validationError) &&
                 validationError.Contains("至少勾选"),
                 "未选择修改项时目标验证失败");
+            var invalidAudioTarget = new ConfigTarget { ModifyAudio = true, MemorySize = 0, Refills = 0 };
+            Assert(
+                !MainForm.ValidateTarget(invalidAudioTarget, out validationError) &&
+                validationError.Contains("音频缓存"),
+                "音频参数越界时目标验证失败");
+            var libraryRoot = Path.Combine(root, "SteamLibrary");
+            var normalInstall = MainForm.CombineSteamInstallPath(libraryRoot, "Helldivers 2");
+            Assert(
+                normalInstall == Path.GetFullPath(Path.Combine(libraryRoot, "steamapps", "common", "Helldivers 2")),
+                "Steam 安装目录在库目录内时可解析");
+            Assert(
+                MainForm.CombineSteamInstallPath(libraryRoot, @"..\..\outside") == null &&
+                MainForm.CombineSteamInstallPath(libraryRoot, Path.GetPathRoot(libraryRoot)) == null,
+                "Steam 清单路径不能逃出库目录");
             var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             if (!string.IsNullOrEmpty(profile))
             {
@@ -370,7 +483,7 @@ namespace Helldivers2CpuFixer.Tests
         {
             try
             {
-                var target = Target(16, 78643200, 4);
+                var target = Target(Math.Min(16, Math.Max(0, Environment.ProcessorCount - 4)), 78643200, 4);
                 var oldText = File.ReadAllText(ini, Encoding.UTF8);
                 ConfigFileOperations.ApplySafely(
                     ini,
